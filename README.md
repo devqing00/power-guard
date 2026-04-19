@@ -1,36 +1,50 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# PowerGuard
 
-## Getting Started
+PowerGuard is an AI-powered autonomous drone monitoring system for power-line inspection in Nigeria.
 
-First, run the development server:
+## Workspace Structure
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+- `frontend/` - Next.js dashboard (App Router, TypeScript)
+- `backend/` - FastAPI API service for telemetry and AI processing
+- `docs/tasks/` - Master board and per-phase execution tracking
+- `.github/copilot-instructions.md` - Project guardrails and phase constraints
+
+## Current Phase
+
+Phases 1 through 4 are complete (backend, AI simulation, map dashboard, offline/assignment UX).
+
+## Quality and Operations
+
+- CI workflow: `.github/workflows/ci.yml`
+- Deployment and environment runbook: `docs/DEPLOYMENT-ENV-RUNBOOK.md`
+- Shared API/data contracts: `docs/SHARED-DATA-CONTRACTS.md`
+
+## Backend Quick Start (Phase 1)
+
+1. Open terminal in `backend/`.
+2. Create virtual environment: `python -m venv .venv`.
+3. Activate venv (PowerShell): `.venv\Scripts\Activate.ps1`.
+4. Install dependencies: `pip install -r requirements.txt`.
+5. Create `.env` from `.env.example` and set valid Firebase values.
+6. Run API: `uvicorn app.main:app --reload --port 8000`.
+
+## Telemetry Endpoint
+
+`POST /api/v1/telemetry`
+
+Example payload:
+
+```json
+{
+  "drone_id": "drone_001",
+  "lat": 6.5244,
+  "lng": 3.3792,
+  "battery": 85
+}
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Notes
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Do not commit service account keys or secrets.
+- Keep API under `/api/v1` for stable contract versioning.
+- Follow phase gates in `docs/tasks/`.
