@@ -22,8 +22,9 @@ const severityColor: Record<string, string> = {
   low: "#7ee787",
 };
 
-const TRAIL_GAP_DEG = 0.000045;
 const TRAIL_SAMPLE_MIN_DEG = 0.000006;
+// Keep this in sync with .drone-marker::after translateY magnitude in globals.css.
+const DRONE_TIP_OFFSET_PX = 8;
 
 function normalizeAngle(angle: number): number {
   let normalized = angle;
@@ -35,6 +36,18 @@ function normalizeAngle(angle: number): number {
 function blendAngle(current: number, target: number, blend: number): number {
   const delta = normalizeAngle(target - current);
   return normalizeAngle(current + delta * blend);
+}
+
+function isValidLngLat(coord: [number, number] | undefined): coord is [number, number] {
+  if (!coord) {
+    return false;
+  }
+  const [lng, lat] = coord;
+  return Number.isFinite(lng) && Number.isFinite(lat) && lat >= -90 && lat <= 90;
+}
+
+function isFinitePoint(point: { x: number; y: number }): boolean {
+  return Number.isFinite(point.x) && Number.isFinite(point.y);
 }
 
 export default function CommandMap({
@@ -72,43 +85,67 @@ export default function CommandMap({
       return;
     }
 
-    const source = mapRef.current.getSource("drone-trails") as mapboxgl.GeoJSONSource | undefined;
+    const map = mapRef.current;
+    const source = map.getSource("drone-trails") as mapboxgl.GeoJSONSource | undefined;
     if (!source) {
       return;
     }
 
     const features = Object.entries(droneTrailRef.current)
       .map(([droneId, path]) => {
-        if (path.length <= 1) {
-          return [droneId, path] as const;
+        const sanitizedPath = path.filter((point) => isValidLngLat(point));
+        const currentRender = droneRendersRef.current[droneId];
+        let coordinates = sanitizedPath;
+
+        // Keep history sampling sparse, but always render the visual tip at the live marker position.
+        if (isValidLngLat(currentRender)) {
+          const headingCandidate = droneHeadingRef.current[droneId] ?? 0;
+          const headingDeg = Number.isFinite(headingCandidate) ? headingCandidate : 0;
+          const headingRad = (headingDeg * Math.PI) / 180;
+          const centerPx = map.project(currentRender);
+          if (!isFinitePoint(centerPx)) {
+            return [droneId, coordinates] as const;
+          }
+
+          const tipX = centerPx.x + Math.sin(headingRad) * DRONE_TIP_OFFSET_PX;
+          const tipY = centerPx.y - Math.cos(headingRad) * DRONE_TIP_OFFSET_PX;
+          if (!Number.isFinite(tipX) || !Number.isFinite(tipY)) {
+            return [droneId, coordinates] as const;
+          }
+
+          const tipPx = new mapboxgl.Point(
+            tipX,
+            tipY,
+          );
+          let tipLngLat: mapboxgl.LngLat;
+          try {
+            tipLngLat = map.unproject(tipPx);
+          } catch {
+            return [droneId, coordinates] as const;
+          }
+          const tip: [number, number] = [tipLngLat.lng, tipLngLat.lat];
+          if (!isValidLngLat(tip)) {
+            return [droneId, coordinates] as const;
+          }
+
+          const last = coordinates[coordinates.length - 1];
+          const isDifferent = !last
+            || Math.abs(last[0] - tip[0]) > 0.0000001
+            || Math.abs(last[1] - tip[1]) > 0.0000001;
+          if (isDifferent) {
+            coordinates = [...coordinates, tip];
+          }
         }
 
-        const trailPath = [...path];
-        const end = trailPath[trailPath.length - 1];
-        const prev = trailPath[trailPath.length - 2];
-        const dx = end[0] - prev[0];
-        const dy = end[1] - prev[1];
-        const length = Math.hypot(dx, dy);
-
-        if (length > 0) {
-          const retreat = Math.min(length * 0.65, TRAIL_GAP_DEG);
-          const unitX = dx / length;
-          const unitY = dy / length;
-          trailPath[trailPath.length - 1] = [
-            end[0] - unitX * retreat,
-            end[1] - unitY * retreat,
-          ];
-        }
-
-        return [droneId, trailPath] as const;
+        return [droneId, coordinates] as const;
       })
-      .filter(([, path]) => path.length > 1)
-      .map(([droneId, path]) => ({
+      .filter(([, coordinates]) => coordinates.length > 1)
+      .map(([droneId, coordinates]) => ({
         type: "Feature" as const,
         properties: { droneId },
         geometry: {
           type: "LineString" as const,
-          coordinates: path,
+          coordinates,
         },
       }));
 
@@ -387,10 +424,27 @@ export default function CommandMap({
 
     const nextDroneIds = new Set<string>();
     drones.forEach((drone) => {
+      const droneCoord: [number, number] = [drone.lng, drone.lat];
+      if (!isValidLngLat(droneCoord)) {
+        const staleMarker = droneMarkersRef.current[drone.id];
+        if (staleMarker) {
+          staleMarker.remove();
+          delete droneMarkersRef.current[drone.id];
+          delete droneTrailRef.current[drone.id];
+          delete droneTargetsRef.current[drone.id];
+          delete droneRendersRef.current[drone.id];
+          delete droneVelocityRef.current[drone.id];
+          delete droneHeadingRef.current[drone.id];
+          delete droneTargetPrevRef.current[drone.id];
+          delete droneTargetAtRef.current[drone.id];
+        }
+        return;
+      }
+
       nextDroneIds.add(drone.id);
       const existing = droneMarkersRef.current[drone.id];
       const now = performance.now();
-      const previousTarget = droneTargetPrevRef.current[drone.id] ?? [drone.lng, drone.lat];
+      const previousTarget = droneTargetPrevRef.current[drone.id] ?? droneCoord;
       const previousAt = droneTargetAtRef.current[drone.id] ?? now;
       const deltaSeconds = Math.max(0.05, (now - previousAt) / 1000);
       const measuredVelocity: [number, number] = [
@@ -402,20 +456,20 @@ export default function CommandMap({
         priorVelocity[0] * 0.45 + measuredVelocity[0] * 0.55,
         priorVelocity[1] * 0.45 + measuredVelocity[1] * 0.55,
       ];
-      droneTargetPrevRef.current[drone.id] = [drone.lng, drone.lat];
+      droneTargetPrevRef.current[drone.id] = droneCoord;
       droneTargetAtRef.current[drone.id] = now;
-      droneTargetsRef.current[drone.id] = [drone.lng, drone.lat];
+      droneTargetsRef.current[drone.id] = droneCoord;
       if (existing) {
         return;
       }
 
       const el = document.createElement("div");
       el.className = "drone-marker";
-      droneRendersRef.current[drone.id] = [drone.lng, drone.lat];
-      droneTrailRef.current[drone.id] = [[drone.lng, drone.lat]];
+      droneRendersRef.current[drone.id] = droneCoord;
+      droneTrailRef.current[drone.id] = [droneCoord];
       droneHeadingRef.current[drone.id] = 0;
       droneMarkersRef.current[drone.id] = new mapboxgl.Marker(el)
-        .setLngLat([drone.lng, drone.lat])
+        .setLngLat(droneCoord)
         .setPopup(
           new Popup({ closeButton: false, className: "pg-popup" }).setHTML(
             `<div class="popup-body"><h4>${drone.id}</h4><p>Battery: ${drone.battery.toFixed(0)}%</p><p>Status: ${drone.status}</p></div>`,
@@ -441,9 +495,13 @@ export default function CommandMap({
 
     drawDroneTrails();
 
-    if (autoFollow && drones.length > 0) {
-      const bounds = new mapboxgl.LngLatBounds([drones[0].lng, drones[0].lat], [drones[0].lng, drones[0].lat]);
-      drones.slice(1).forEach((drone) => bounds.extend([drone.lng, drone.lat]));
+    const validDronePoints = drones
+      .map((drone) => [drone.lng, drone.lat] as [number, number])
+      .filter((point) => isValidLngLat(point));
+
+    if (autoFollow && validDronePoints.length > 0) {
+      const bounds = new mapboxgl.LngLatBounds(validDronePoints[0], validDronePoints[0]);
+      validDronePoints.slice(1).forEach((point) => bounds.extend(point));
 
       mapRef.current.fitBounds(bounds, {
         padding: { top: 180, right: 220, bottom: 100, left: 100 },
@@ -464,11 +522,12 @@ export default function CommandMap({
       lastFrameAtRef.current = now;
       const blend = Math.min(0.38, Math.max(0.12, frameDeltaMs / 95));
       let trailsChanged = false;
+      let markersMoved = false;
 
       Object.entries(droneMarkersRef.current).forEach(([droneId, marker]) => {
         const target = droneTargetsRef.current[droneId];
         const render = droneRendersRef.current[droneId];
-        if (!target || !render) {
+        if (!isValidLngLat(target) || !isValidLngLat(render)) {
           return;
         }
 
@@ -480,12 +539,21 @@ export default function CommandMap({
         ];
         const nextLng = render[0] + (predictedTarget[0] - render[0]) * blend;
         const nextLat = render[1] + (predictedTarget[1] - render[1]) * blend;
+        if (!isValidLngLat([nextLng, nextLat])) {
+          return;
+        }
 
         const moveLng = nextLng - render[0];
         const moveLat = nextLat - render[1];
+        if (Math.abs(moveLng) + Math.abs(moveLat) > 0.00000005) {
+          markersMoved = true;
+        }
         if (Math.abs(moveLng) + Math.abs(moveLat) > 0.000001 && mapRef.current) {
           const from = mapRef.current.project([render[0], render[1]]);
           const to = mapRef.current.project([nextLng, nextLat]);
+          if (!Number.isFinite(from.x) || !Number.isFinite(from.y) || !Number.isFinite(to.x) || !Number.isFinite(to.y)) {
+            return;
+          }
           const screenDx = to.x - from.x;
           const screenDy = to.y - from.y;
           // 0deg points up; positive rotates clockwise to align with CSS marker arrow.
@@ -495,13 +563,14 @@ export default function CommandMap({
           droneHeadingRef.current[droneId] = smoothHeading;
           marker.getElement().style.setProperty("--drone-heading", `${smoothHeading}deg`);
 
-          const path = droneTrailRef.current[droneId] ?? [[render[0], render[1]]];
+          const path: [number, number][] = droneTrailRef.current[droneId] ?? [[render[0], render[1]]];
           const last = path[path.length - 1];
           const movedEnough = !last
             || Math.abs(last[0] - nextLng) > TRAIL_SAMPLE_MIN_DEG
             || Math.abs(last[1] - nextLat) > TRAIL_SAMPLE_MIN_DEG;
           if (movedEnough) {
-            droneTrailRef.current[droneId] = [...path, [nextLng, nextLat]].slice(-42);
+            const nextPoint: [number, number] = [nextLng, nextLat];
+            droneTrailRef.current[droneId] = [...path, nextPoint].slice(-42);
             trailsChanged = true;
           }
         }
@@ -509,7 +578,7 @@ export default function CommandMap({
         marker.setLngLat([nextLng, nextLat]);
       });
 
-      if (trailsChanged) {
+      if (trailsChanged || markersMoved) {
         drawDroneTrails();
       }
 
@@ -530,10 +599,15 @@ export default function CommandMap({
 
     const nextFaultIds = new Set<string>();
     faults.forEach((fault) => {
+      const faultCoord: [number, number] = [fault.lng, fault.lat];
+      if (!isValidLngLat(faultCoord)) {
+        return;
+      }
+
       nextFaultIds.add(fault.id);
       const existing = faultMarkersRef.current[fault.id];
       if (existing) {
-        existing.setLngLat([fault.lng, fault.lat]);
+        existing.setLngLat(faultCoord);
         return;
       }
 
@@ -542,7 +616,7 @@ export default function CommandMap({
       el.style.background = severityColor[fault.severity] ?? "#f0f6fc";
 
       faultMarkersRef.current[fault.id] = new mapboxgl.Marker(el)
-        .setLngLat([fault.lng, fault.lat])
+        .setLngLat(faultCoord)
         .setPopup(
           new Popup({ closeButton: false, className: "pg-popup" }).setHTML(
             `<div class="popup-body"><h4>${fault.faultType}</h4><p>Severity: ${fault.severity}</p><p>Confidence: ${(fault.confidence * 100).toFixed(1)}%</p></div>`,

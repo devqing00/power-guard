@@ -57,6 +57,15 @@ export type SimulatorStatus = {
 const BACKEND_API_BASE =
   process.env.NEXT_PUBLIC_BACKEND_API_BASE?.replace(/\/$/, "") ?? "http://127.0.0.1:8000/api/v1";
 
+function isValidCoordinate(lat: number, lng: number): boolean {
+  return Number.isFinite(lat)
+    && Number.isFinite(lng)
+    && lat >= -90
+    && lat <= 90
+    && lng >= -180
+    && lng <= 180;
+}
+
 export function subscribeToMonitoringData(
   onDrones: (drones: DroneState[]) => void,
   onFaults: (faults: FaultState[]) => void,
@@ -67,6 +76,7 @@ export function subscribeToMonitoringData(
     onError("Firebase env vars are missing in frontend/.env.local.");
     return () => {};
   }
+  const firestore = db;
 
   let unsubDrones: (() => void) | null = null;
   let unsubFaults: (() => void) | null = null;
@@ -90,69 +100,85 @@ export function subscribeToMonitoringData(
       }
 
       unsubDrones = onSnapshot(
-        collection(db, "drones"),
+        collection(firestore, "drones"),
         (snapshot) => {
-          const drones = snapshot.docs.map((doc) => {
-            const data = doc.data();
-            return {
-              id: doc.id,
-              lat: Number(data.lat ?? 0),
-              lng: Number(data.lng ?? 0),
-              altitude: Number(data.altitude ?? 0),
-              battery: Number(data.battery ?? 0),
-              status: String(data.status ?? "unknown"),
-              controlMode: String(data.control_mode ?? "auto") === "manual" ? "manual" : "auto",
-              controlOwner: data.control_owner ? String(data.control_owner) : null,
-              waypointQueueCount: Number(data.waypoint_queue_count ?? 0),
-              waypointQueue: Array.isArray(data.waypoint_queue)
-                ? data.waypoint_queue
-                    .map((item) => ({
-                      lat: Number(item?.lat ?? 0),
-                      lng: Number(item?.lng ?? 0),
-                    }))
-                    .filter((item) => Number.isFinite(item.lat) && Number.isFinite(item.lng))
-                : [],
-            } satisfies DroneState;
-          });
+          const drones = snapshot.docs
+            .map((doc) => {
+              const data = doc.data();
+              const lat = Number(data.lat ?? 0);
+              const lng = Number(data.lng ?? 0);
+              if (!isValidCoordinate(lat, lng)) {
+                return null;
+              }
+
+              return {
+                id: doc.id,
+                lat,
+                lng,
+                altitude: Number(data.altitude ?? 0),
+                battery: Number(data.battery ?? 0),
+                status: String(data.status ?? "unknown"),
+                controlMode: String(data.control_mode ?? "auto") === "manual" ? "manual" : "auto",
+                controlOwner: data.control_owner ? String(data.control_owner) : null,
+                waypointQueueCount: Number(data.waypoint_queue_count ?? 0),
+                waypointQueue: Array.isArray(data.waypoint_queue)
+                  ? data.waypoint_queue
+                      .map((item) => ({
+                        lat: Number(item?.lat ?? 0),
+                        lng: Number(item?.lng ?? 0),
+                      }))
+                      .filter((item) => isValidCoordinate(item.lat, item.lng))
+                  : [],
+              } satisfies DroneState;
+            })
+            .filter((drone): drone is DroneState => drone !== null);
           onDrones(drones);
         },
         (error) => onError(formatPermissionError("Drones listener error", error.message)),
       );
 
       unsubFaults = onSnapshot(
-        collection(db, "faults"),
+        collection(firestore, "faults"),
         (snapshot) => {
-          const faults = snapshot.docs.map((doc) => {
-            const data = doc.data();
-            return {
-              id: doc.id,
-              droneId: String(data.drone_id ?? "unknown"),
-              lat: Number(data.lat ?? 0),
-              lng: Number(data.lng ?? 0),
-              locationName: data.location_name ? String(data.location_name) : null,
-              faultType: String(data.fault_type ?? "unknown"),
-              severity: String(data.severity ?? "unknown"),
-              confidence: Number(data.confidence ?? 0),
-              status: (() => {
-                const current = String(data.status ?? "unresolved");
-                if (current === "assigned" || current === "resolved" || current === "unresolved") {
-                  return current;
-                }
-                return "unresolved";
-              })(),
-              assignee: data.assignee ? String(data.assignee) : null,
-              detectedAt: data.detected_at?.toDate?.()?.toISOString?.() ?? null,
-              assignedAt: data.assigned_at?.toDate?.()?.toISOString?.() ?? null,
-              resolvedAt: data.resolved_at?.toDate?.()?.toISOString?.() ?? null,
-            } satisfies FaultState;
-          });
+          const faults = snapshot.docs
+            .map((doc) => {
+              const data = doc.data();
+              const lat = Number(data.lat ?? 0);
+              const lng = Number(data.lng ?? 0);
+              if (!isValidCoordinate(lat, lng)) {
+                return null;
+              }
+
+              return {
+                id: doc.id,
+                droneId: String(data.drone_id ?? "unknown"),
+                lat,
+                lng,
+                locationName: data.location_name ? String(data.location_name) : null,
+                faultType: String(data.fault_type ?? "unknown"),
+                severity: String(data.severity ?? "unknown"),
+                confidence: Number(data.confidence ?? 0),
+                status: (() => {
+                  const current = String(data.status ?? "unresolved");
+                  if (current === "assigned" || current === "resolved" || current === "unresolved") {
+                    return current;
+                  }
+                  return "unresolved";
+                })(),
+                assignee: data.assignee ? String(data.assignee) : null,
+                detectedAt: data.detected_at?.toDate?.()?.toISOString?.() ?? null,
+                assignedAt: data.assigned_at?.toDate?.()?.toISOString?.() ?? null,
+                resolvedAt: data.resolved_at?.toDate?.()?.toISOString?.() ?? null,
+              } satisfies FaultState;
+            })
+            .filter((fault): fault is FaultState => fault !== null);
           onFaults(faults);
         },
         (error) => onError(formatPermissionError("Faults listener error", error.message)),
       );
 
       unsubOperators = onSnapshot(
-        collection(db, "operators"),
+        collection(firestore, "operators"),
         (snapshot) => {
           const operators = snapshot.docs.map((operatorDoc) => {
             const data = operatorDoc.data();
@@ -198,8 +224,9 @@ export async function updateFaultStatus(
   if (!hasFirebaseConfig || !db) {
     throw new Error("Firebase env vars are missing in frontend/.env.local.");
   }
+  const firestore = db;
 
-  const ref = doc(collection(db, "faults"), faultId);
+  const ref = doc(collection(firestore, "faults"), faultId);
   if (status === "assigned") {
     await updateDoc(ref, {
       status,
