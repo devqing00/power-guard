@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     app_env: str = "development"
 
     frontend_origin: str = "http://localhost:3000"
+    frontend_origins: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of allowed frontend origins for CORS",
+    )
 
     analyze_use_mock: bool = True
     analyze_fault_probability: float = 0.06
@@ -94,6 +98,29 @@ class Settings(BaseSettings):
                 "Set AFRICASTALKING_USERNAME, AFRICASTALKING_API_KEY, and OPS_PHONE_NUMBER to enable SMS.",
             )
         return True, "ok"
+
+    @property
+    def cors_origins(self) -> list[str]:
+        origins: list[str] = []
+
+        if self.frontend_origin and self.frontend_origin.strip():
+            origins.append(self.frontend_origin.strip())
+
+        if self.frontend_origins:
+            origins.extend(
+                origin.strip()
+                for origin in self.frontend_origins.split(",")
+                if origin.strip()
+            )
+
+        origins.extend([
+            "http://127.0.0.1:3000",
+            "http://localhost:3000",
+        ])
+
+        # Preserve order while removing duplicates.
+        unique_origins = list(dict.fromkeys(origins))
+        return unique_origins
 
 
 @lru_cache(maxsize=1)
