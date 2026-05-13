@@ -84,6 +84,19 @@ const DEFAULT_POSITIONS: Record<WidgetId, WidgetPosition> = {
   error: { x: 430, y: 24 },
 };
 
+const DEFAULT_COLLAPSED: Record<WidgetId, boolean> = {
+  title: false,
+  metrics: false,
+  reports: false,
+  stream: false,
+  manual: false,
+  faults: false,
+  table: false,
+  error: false,
+};
+
+const WIDGET_COLLAPSE_STORAGE_KEY = "powerguard.widgets.collapsed.v1";
+
 const SNAP_DISTANCE = 28;
 const SNAP_MARGIN = 18;
 const TELEMETRY_PAGE_SIZE = 5;
@@ -98,6 +111,8 @@ type DraggableWidgetProps = {
   title: string;
   className?: string;
   onStartDrag: (id: WidgetId, event: React.PointerEvent<HTMLDivElement>) => void;
+  collapsed?: boolean;
+  onToggleCollapse?: (id: WidgetId) => void;
   children: ReactNode;
 };
 
@@ -106,20 +121,55 @@ function DraggableWidget({
   title,
   className,
   onStartDrag,
+  collapsed = false,
+  onToggleCollapse,
   children,
 }: DraggableWidgetProps) {
+  const toggleLabel = collapsed ? "Expand widget" : "Collapse widget";
+
   return (
     <article
       data-widget-id={id}
-      className={`glass widget-shell ${className ?? ""}`.trim()}
+      className={`glass widget-shell ${collapsed ? "is-collapsed" : ""} ${className ?? ""}`.trim()}
     >
       <div className="widget-handle" onPointerDown={(event) => onStartDrag(id, event)}>
         <span>{title}</span>
-        <span className="widget-grip" aria-hidden="true">::::</span>
+        <span className="widget-actions">
+          <button
+            type="button"
+            className="widget-action-btn"
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleCollapse?.(id);
+            }}
+            aria-label={`${toggleLabel}: ${title}`}
+          >
+            {collapsed ? "+" : "-"}
+          </button>
+          <span className="widget-grip" aria-hidden="true">::::</span>
+        </span>
       </div>
-      {children}
+      {collapsed ? null : <div className="widget-body">{children}</div>}
     </article>
   );
+}
+
+function loadCollapsedWidgets(): Record<WidgetId, boolean> {
+  if (typeof window === "undefined") {
+    return { ...DEFAULT_COLLAPSED };
+  }
+
+  try {
+    const raw = window.localStorage.getItem(WIDGET_COLLAPSE_STORAGE_KEY);
+    if (!raw) {
+      return { ...DEFAULT_COLLAPSED };
+    }
+    const parsed = JSON.parse(raw) as Partial<Record<WidgetId, boolean>>;
+    return { ...DEFAULT_COLLAPSED, ...parsed };
+  } catch {
+    return { ...DEFAULT_COLLAPSED };
+  }
 }
 
 export default function Home() {
@@ -152,6 +202,10 @@ export default function Home() {
   const [reportEndDate, setReportEndDate] = useState<string>("");
   const [alertPulse, setAlertPulse] = useState<AlertPulse>("none");
   const [edgeEffectLevel, setEdgeEffectLevel] = useState<EdgeEffectLevel>("subtle");
+  const [isClient, setIsClient] = useState(false);
+  const [clockNow, setClockNow] = useState<Date>(() => new Date());
+  const [collapsedWidgets, setCollapsedWidgets] = useState<Record<WidgetId, boolean>>(DEFAULT_COLLAPSED);
+  const [collapsedReady, setCollapsedReady] = useState(false);
   const knownFaultsRef = useRef<Set<string>>(new Set());
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const dragStateRef = useRef<{ pointerOffsetX: number; pointerOffsetY: number } | null>(null);
@@ -160,6 +214,24 @@ export default function Home() {
     const unsubscribe = subscribeToMonitoringData(setDrones, setFaults, setOperators, setError);
     return () => unsubscribe();
   }, []);
+
+  useEffect(() => {
+    setIsClient(true);
+    const timer = window.setInterval(() => setClockNow(new Date()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    setCollapsedWidgets(loadCollapsedWidgets());
+    setCollapsedReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !collapsedReady) {
+      return;
+    }
+    window.localStorage.setItem(WIDGET_COLLAPSE_STORAGE_KEY, JSON.stringify(collapsedWidgets));
+  }, [collapsedReady, collapsedWidgets]);
 
   useEffect(() => {
     getSimulatorStatus()
@@ -217,6 +289,36 @@ export default function Home() {
     () => faults.filter((fault) => fault.status === "unresolved").length,
     [faults],
   );
+
+  const clockLabel = useMemo(
+    () => clockNow.toLocaleTimeString("en-GB", {
+      hour12: false,
+      timeZone: "UTC",
+    }),
+    [clockNow],
+  );
+
+  const clockDate = useMemo(
+    () => clockNow.toLocaleDateString("en-GB", {
+      timeZone: "UTC",
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    }),
+    [clockNow],
+  );
+
+  const tickerText = useMemo(() => {
+    const scenario = simStatus?.scenario?.replaceAll("_", " ") ?? "balanced";
+    const patrolStatus = simStatus?.running ? "auto patrol running" : "auto patrol idle";
+    return [
+      `Drones online: ${activeDrones}`,
+      `Critical+: ${criticalFaults}`,
+      `Unresolved: ${unresolvedFaults}`,
+      patrolStatus,
+      `Scenario: ${scenario}`,
+    ].join("  •  ");
+  }, [activeDrones, criticalFaults, unresolvedFaults, simStatus]);
 
   const storyCards = useMemo(() => {
     const now = new Date();
@@ -426,6 +528,13 @@ export default function Home() {
       pointerOffsetY: event.clientY - targetBounds.top,
     };
     setDraggingId(widgetId);
+  }
+
+  function toggleWidget(widgetId: WidgetId): void {
+    setCollapsedWidgets((prev) => ({
+      ...prev,
+      [widgetId]: !prev[widgetId],
+    }));
   }
 
   const operatorNames = useMemo(() => {
@@ -908,12 +1017,33 @@ export default function Home() {
         />
       </section>
 
+      <div className="scanline-overlay" aria-hidden="true" />
+
       <section ref={overlayRef} className="overlay-stage">
+        <div className="hud-clock glass" aria-live="polite">
+          <span className="clock-label">UTC</span>
+          <span className="clock-time" suppressHydrationWarning>
+            {isClient ? clockLabel : "--:--:--"}
+          </span>
+          <span className="clock-date" suppressHydrationWarning>
+            {isClient ? clockDate : "-- --- ----"}
+          </span>
+        </div>
+
+        <div className="hud-ticker glass" aria-live="polite">
+          <div className="ticker-track">
+            <span>{tickerText}</span>
+            <span aria-hidden="true">{tickerText}</span>
+          </div>
+        </div>
+
         <DraggableWidget
           id="title"
           title="Control Panel"
           className={draggingId === "title" ? "is-dragging" : undefined}
           onStartDrag={startDrag}
+          collapsed={collapsedWidgets.title ?? false}
+          onToggleCollapse={toggleWidget}
         >
           <div className="panel-title">
           <p className="eyebrow">PowerGuard // Command Center</p>
@@ -948,6 +1078,8 @@ export default function Home() {
           title="Mission Metrics"
           className={draggingId === "metrics" ? "is-dragging" : undefined}
           onStartDrag={startDrag}
+          collapsed={collapsedWidgets.metrics ?? false}
+          onToggleCollapse={toggleWidget}
         >
           <div className="panel-metrics">
           <div>
@@ -979,6 +1111,8 @@ export default function Home() {
           title="Inspection Reports"
           className={draggingId === "reports" ? "is-dragging" : undefined}
           onStartDrag={startDrag}
+          collapsed={collapsedWidgets.reports ?? false}
+          onToggleCollapse={toggleWidget}
         >
           <div className="panel-report">
             <h2>Inspection Reports</h2>
@@ -1027,6 +1161,8 @@ export default function Home() {
           title="Drone Telemetry"
           className={draggingId === "stream" ? "is-dragging" : undefined}
           onStartDrag={startDrag}
+          collapsed={collapsedWidgets.stream ?? false}
+          onToggleCollapse={toggleWidget}
         >
           <div className="panel-stream">
           <h2>Drone Telemetry</h2>
@@ -1062,6 +1198,8 @@ export default function Home() {
             title="Manual Drone Controls"
             className={draggingId === "manual" ? "is-dragging" : undefined}
             onStartDrag={startDrag}
+            collapsed={collapsedWidgets.manual ?? false}
+            onToggleCollapse={toggleWidget}
           >
             <div className="panel-manual">
               <h2>Manual Patrol Console</h2>
@@ -1183,6 +1321,8 @@ export default function Home() {
           title="Fault Feed"
           className={draggingId === "faults" ? "is-dragging" : undefined}
           onStartDrag={startDrag}
+          collapsed={collapsedWidgets.faults ?? false}
+          onToggleCollapse={toggleWidget}
         >
           <div className="panel-faults">
           <h2>Fault Feed</h2>
@@ -1211,6 +1351,8 @@ export default function Home() {
           title="Assignment Workflow"
           className={draggingId === "table" ? "is-dragging" : undefined}
           onStartDrag={startDrag}
+          collapsed={collapsedWidgets.table ?? false}
+          onToggleCollapse={toggleWidget}
         >
           <div className="panel-table" aria-label="Fault workflow table">
           <h2>Assignment Workflow</h2>
@@ -1316,6 +1458,8 @@ export default function Home() {
             title="System Alert"
             className={`panel-error ${draggingId === "error" ? "is-dragging" : ""}`}
             onStartDrag={startDrag}
+            collapsed={collapsedWidgets.error ?? false}
+            onToggleCollapse={toggleWidget}
           >
             <div>{error}</div>
           </DraggableWidget>

@@ -3,7 +3,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import mapboxgl, { Map, Marker, Popup } from "mapbox-gl";
 
-import type { DroneState, FaultState } from "@/lib/monitoring";
+import {
+  fetchPowerLines,
+  type DroneState,
+  type FaultState,
+  type PowerLineFeature,
+  type PowerLineFeatureCollection,
+  type PowerLineProperties,
+} from "@/lib/monitoring";
+import { NIGERIA_OUTLINE } from "@/lib/geo";
 
 type CommandMapProps = {
   drones: DroneState[];
@@ -25,6 +33,28 @@ const severityColor: Record<string, string> = {
 const TRAIL_SAMPLE_MIN_DEG = 0.000006;
 // Keep this in sync with .drone-marker::after translateY magnitude in globals.css.
 const DRONE_TIP_OFFSET_PX = 8;
+const NIGERIA_CENTER: [number, number] = [8.6753, 9.0820];
+const CAMERA_3D = { pitch: 56, bearing: -14, zoom: 5.25 };
+const CAMERA_2D = { pitch: 0, bearing: 0, zoom: 5.6 };
+const NIGERIA_SOURCE_ID = "nigeria-outline";
+const POWER_LINE_SOURCE_ID = "power-lines";
+const POWER_LINE_DOTS_SOURCE_ID = "power-line-dots";
+const POWER_LINE_BASE_LAYER = "power-lines-base";
+const POWER_LINE_GLOW_LAYER = "power-lines-glow";
+const POWER_LINE_FLOW_LAYER = "power-lines-flow";
+const POWER_LINE_DOTS_LAYER = "power-lines-dots";
+const POWER_LINE_HOVER_LAYER = "power-lines-hover";
+const POWER_LINE_HIT_LAYER = "power-lines-hit";
+const POWER_LINE_DOT_COUNT = 2;
+const POWER_LINE_DOT_UPDATE_MS = 90;
+const FLOW_DASH_STEP_MS = 130;
+const FLOW_DASH_SEQUENCE: Array<[number, number]> = [
+  [0.3, 2.6],
+  [0.7, 2.2],
+  [1.1, 1.8],
+  [1.6, 1.4],
+  [2.0, 1.0],
+];
 
 function normalizeAngle(angle: number): number {
   let normalized = angle;
@@ -50,6 +80,116 @@ function isFinitePoint(point: { x: number; y: number }): boolean {
   return Number.isFinite(point.x) && Number.isFinite(point.y);
 }
 
+type PowerLineTrack = {
+  id: string;
+  properties: PowerLineProperties;
+  coordinates: Array<[number, number]>;
+  distances: number[];
+  length: number;
+  speed: number;
+  offset: number;
+};
+
+function buildPowerLineTrack(feature: PowerLineFeature): PowerLineTrack | null {
+  const coords = feature.geometry.coordinates ?? [];
+  const sanitized = coords.filter((coord) => isValidLngLat(coord));
+  if (sanitized.length < 2) {
+    return null;
+  }
+
+  const distances: number[] = [0];
+  let total = 0;
+  for (let index = 1; index < sanitized.length; index += 1) {
+    const [prevLng, prevLat] = sanitized[index - 1];
+    const [nextLng, nextLat] = sanitized[index];
+    const delta = Math.hypot(nextLng - prevLng, nextLat - prevLat);
+    total += delta;
+    distances.push(total);
+  }
+
+  if (!Number.isFinite(total) || total <= 0) {
+    return null;
+  }
+
+  return {
+    id: feature.id,
+    properties: feature.properties,
+    coordinates: sanitized,
+    distances,
+    length: total,
+    speed: 0.015 + Math.random() * 0.03,
+    offset: Math.random(),
+  };
+}
+
+function interpolatePowerLine(track: PowerLineTrack, progress: number): [number, number] | null {
+  const clamped = Math.max(0, Math.min(1, progress));
+  const target = clamped * track.length;
+  const distances = track.distances;
+  let low = 1;
+  let high = distances.length - 1;
+
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (distances[mid] < target) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+
+  const index = Math.max(1, low);
+  const start = track.coordinates[index - 1];
+  const end = track.coordinates[index];
+  const segmentLength = distances[index] - distances[index - 1];
+  if (!Number.isFinite(segmentLength) || segmentLength <= 0) {
+    return start;
+  }
+
+  const ratio = (target - distances[index - 1]) / segmentLength;
+  const lng = start[0] + (end[0] - start[0]) * ratio;
+  const lat = start[1] + (end[1] - start[1]) * ratio;
+  return [lng, lat];
+}
+
+function buildPowerLineDots(tracks: PowerLineTrack[], nowMs: number) {
+  const seconds = nowMs / 1000;
+  const features = tracks.flatMap((track) => {
+    const dots: Array<{
+      type: "Feature";
+      properties: { line_id: string; voltage_kv: number };
+      geometry: { type: "Point"; coordinates: [number, number] };
+    }> = [];
+
+    for (let index = 0; index < POWER_LINE_DOT_COUNT; index += 1) {
+      const offset = index / Math.max(1, POWER_LINE_DOT_COUNT);
+      const progress = (track.offset + seconds * track.speed + offset) % 1;
+      const coord = interpolatePowerLine(track, progress);
+      if (!coord) {
+        continue;
+      }
+      dots.push({
+        type: "Feature",
+        properties: {
+          line_id: track.id,
+          voltage_kv: track.properties.voltage_kv,
+        },
+        geometry: {
+          type: "Point",
+          coordinates: coord,
+        },
+      });
+    }
+
+    return dots;
+  });
+
+  return {
+    type: "FeatureCollection" as const,
+    features,
+  };
+}
+
 export default function CommandMap({
   drones,
   faults,
@@ -72,11 +212,20 @@ export default function CommandMap({
   const lastFrameAtRef = useRef<number>(0);
   const faultMarkersRef = useRef<Record<string, Marker>>({});
   const droneTrailRef = useRef<Record<string, [number, number][]>>({});
-  const [is3dEnabled, setIs3dEnabled] = useState(false);
+  const powerLinesRef = useRef<PowerLineFeatureCollection | null>(null);
+  const powerLineTracksRef = useRef<PowerLineTrack[]>([]);
+  const powerLinePopupRef = useRef<Popup | null>(null);
+  const powerLineHoverIdRef = useRef<string | number | null>(null);
+  const powerLineLoadedRef = useRef(false);
+  const powerLineLastUpdateRef = useRef<number>(0);
+  const powerLineDashRef = useRef<number>(-1);
+  const [is3dEnabled, setIs3dEnabled] = useState(true);
+  const [has3dBuildings, setHas3dBuildings] = useState(false);
   const [autoFollow, setAutoFollow] = useState(false);
   const [showControls, setShowControls] = useState(false);
   const [mapReady, setMapReady] = useState(false);
   const [mapError, setMapError] = useState<string>("");
+  const [powerLineError, setPowerLineError] = useState<string>("");
 
   const token = process.env.NEXT_PUBLIC_MAPBOX_ACCESS_TOKEN;
 
@@ -155,6 +304,54 @@ export default function CommandMap({
     });
   }, [mapReady]);
 
+  const syncPowerLineSource = useCallback((collection: PowerLineFeatureCollection) => {
+    if (!mapRef.current || !mapReady) {
+      return;
+    }
+
+    const map = mapRef.current;
+    const source = map.getSource(POWER_LINE_SOURCE_ID) as mapboxgl.GeoJSONSource | undefined;
+    if (!source) {
+      return;
+    }
+
+    source.setData(collection);
+  }, [mapReady]);
+
+  useEffect(() => {
+    let active = true;
+    fetchPowerLines()
+      .then((collection) => {
+        if (!active) {
+          return;
+        }
+        powerLinesRef.current = collection;
+        powerLineTracksRef.current = collection.features
+          .map((feature) => buildPowerLineTrack(feature))
+          .filter((track): track is PowerLineTrack => track !== null);
+        powerLineLoadedRef.current = true;
+        setPowerLineError("");
+        syncPowerLineSource(collection);
+      })
+      .catch((error) => {
+        if (!active) {
+          return;
+        }
+        setPowerLineError(error instanceof Error ? error.message : "Unable to load power-line data.");
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [syncPowerLineSource]);
+
+  useEffect(() => {
+    if (!mapReady || !powerLinesRef.current) {
+      return;
+    }
+    syncPowerLineSource(powerLinesRef.current);
+  }, [mapReady, syncPowerLineSource]);
+
   const recenterToOperations = useCallback(() => {
     if (!mapRef.current) {
       return;
@@ -187,7 +384,7 @@ export default function CommandMap({
 
   const toggle3DBuildings = useCallback(() => {
     const map = mapRef.current;
-    if (!map || !mapReady) {
+    if (!map || !mapReady || !has3dBuildings) {
       return;
     }
 
@@ -197,23 +394,27 @@ export default function CommandMap({
     if (map.getLayer("3d-buildings")) {
       map.setLayoutProperty("3d-buildings", "visibility", nextValue ? "visible" : "none");
     }
+    if (map.getLayer("building-outline")) {
+      map.setLayoutProperty("building-outline", "visibility", nextValue ? "visible" : "none");
+    }
 
     map.easeTo({
-      pitch: nextValue ? 58 : 35,
-      bearing: nextValue ? -18 : -12,
+      pitch: nextValue ? CAMERA_3D.pitch : CAMERA_2D.pitch,
+      bearing: nextValue ? CAMERA_3D.bearing : CAMERA_2D.bearing,
+      zoom: nextValue ? CAMERA_3D.zoom : CAMERA_2D.zoom,
       duration: 650,
     });
-  }, [is3dEnabled, mapReady]);
+  }, [has3dBuildings, is3dEnabled, mapReady]);
 
   const goNigeriaView = useCallback(() => {
     mapRef.current?.easeTo({
-      center: [8.6753, 9.0820],
-      zoom: 5.6,
-      pitch: 8,
-      bearing: 0,
+      center: NIGERIA_CENTER,
+      zoom: is3dEnabled ? CAMERA_3D.zoom : CAMERA_2D.zoom,
+      pitch: is3dEnabled ? CAMERA_3D.pitch : CAMERA_2D.pitch,
+      bearing: is3dEnabled ? CAMERA_3D.bearing : CAMERA_2D.bearing,
       duration: 900,
     });
-  }, []);
+  }, [is3dEnabled]);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current || !token) return;
@@ -225,11 +426,13 @@ export default function CommandMap({
     const map = new mapboxgl.Map({
       container: containerRef.current,
       style: "mapbox://styles/mapbox/dark-v11",
-      center: [3.3792, 6.5244],
-      zoom: 10.4,
-      pitch: 35,
-      bearing: -12,
+      center: NIGERIA_CENTER,
+      zoom: is3dEnabled ? CAMERA_3D.zoom : CAMERA_2D.zoom,
+      pitch: is3dEnabled ? CAMERA_3D.pitch : CAMERA_2D.pitch,
+      bearing: is3dEnabled ? CAMERA_3D.bearing : CAMERA_2D.bearing,
       antialias: true,
+      projection: "globe",
+      renderWorldCopies: false,
     });
 
     map.on("error", (event) => {
@@ -251,9 +454,192 @@ export default function CommandMap({
     map.on("load", () => {
       setMapError("");
       map.setFog({
-        color: "rgb(5, 17, 25)",
-        "high-color": "rgb(12, 46, 61)",
-        "horizon-blend": 0.18,
+        color: "rgb(6, 18, 28)",
+        "high-color": "rgb(12, 32, 45)",
+        "space-color": "rgb(3, 8, 14)",
+        "horizon-blend": 0.22,
+      });
+
+      map.setLight({
+        anchor: "viewport",
+        position: [1.1, 120, 80],
+        intensity: 0.48,
+        color: "rgb(170, 214, 255)",
+      });
+
+      const labelLayerId = map.getStyle().layers?.find(
+        (layer) => layer.type === "symbol" && layer.layout && "text-field" in layer.layout,
+      )?.id;
+
+      if (map.getSource("composite")) {
+        map.addLayer({
+          id: "3d-buildings",
+          source: "composite",
+          "source-layer": "building",
+          filter: ["==", "extrude", "true"],
+          type: "fill-extrusion",
+          minzoom: 14,
+          layout: {
+            visibility: is3dEnabled ? "visible" : "none",
+          },
+          paint: {
+            "fill-extrusion-color": "#0c2734",
+            "fill-extrusion-height": ["get", "height"],
+            "fill-extrusion-base": ["get", "min_height"],
+            "fill-extrusion-opacity": 0.18,
+            "fill-extrusion-vertical-gradient": false,
+          },
+        }, labelLayerId);
+
+        map.addLayer({
+          id: "building-outline",
+          source: "composite",
+          "source-layer": "building",
+          type: "line",
+          minzoom: 13,
+          layout: {
+            visibility: is3dEnabled ? "visible" : "none",
+          },
+          paint: {
+            "line-color": "#7ad9ff",
+            "line-width": 1.05,
+            "line-opacity": 0.7,
+          },
+        }, labelLayerId);
+        setHas3dBuildings(true);
+      } else {
+        setHas3dBuildings(false);
+      }
+
+      map.addSource(NIGERIA_SOURCE_ID, {
+        type: "geojson",
+        data: NIGERIA_OUTLINE,
+      });
+
+      map.addLayer({
+        id: "nigeria-fill",
+        type: "fill",
+        source: NIGERIA_SOURCE_ID,
+        maxzoom: 6.2,
+        paint: {
+          "fill-color": "#0b2430",
+          "fill-opacity": 0.2,
+        },
+      });
+
+      map.addLayer({
+        id: "nigeria-outline",
+        type: "line",
+        source: NIGERIA_SOURCE_ID,
+        maxzoom: 6.2,
+        paint: {
+          "line-color": "#5af2d6",
+          "line-width": 1,
+          "line-opacity": 0.55,
+        },
+      });
+
+      map.addSource(POWER_LINE_SOURCE_ID, {
+        type: "geojson",
+        data: {
+          type: "FeatureCollection",
+          features: [],
+        },
+        lineMetrics: true,
+        promoteId: "id",
+      });
+
+      map.addLayer({
+        id: POWER_LINE_BASE_LAYER,
+        type: "line",
+        source: POWER_LINE_SOURCE_ID,
+        layout: {
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#1c88a6",
+          "line-width": 1.1,
+          "line-opacity": 0.45,
+        },
+      });
+
+      map.addLayer({
+        id: POWER_LINE_GLOW_LAYER,
+        type: "line",
+        source: POWER_LINE_SOURCE_ID,
+        layout: {
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#18c6ff",
+          "line-width": 4.4,
+          "line-blur": 2.4,
+          "line-opacity": 0.18,
+        },
+      });
+
+      map.addLayer({
+        id: POWER_LINE_FLOW_LAYER,
+        type: "line",
+        source: POWER_LINE_SOURCE_ID,
+        layout: {
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#63e4ff",
+          "line-width": 2,
+          "line-opacity": 0.9,
+          "line-dasharray": FLOW_DASH_SEQUENCE[0],
+        },
+      });
+
+      map.addLayer({
+        id: POWER_LINE_HOVER_LAYER,
+        type: "line",
+        source: POWER_LINE_SOURCE_ID,
+        layout: {
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#a6fff2",
+          "line-width": 3.2,
+          "line-opacity": ["case", ["boolean", ["feature-state", "hover"], false], 0.95, 0],
+        },
+      });
+
+      map.addLayer({
+        id: POWER_LINE_HIT_LAYER,
+        type: "line",
+        source: POWER_LINE_SOURCE_ID,
+        paint: {
+          "line-opacity": 0,
+          "line-width": 12,
+        },
+      });
+
+      map.addSource(POWER_LINE_DOTS_SOURCE_ID, {
+        type: "geojson",
+        data: {
+          type: "FeatureCollection",
+          features: [],
+        },
+      });
+
+      map.addLayer({
+        id: POWER_LINE_DOTS_LAYER,
+        type: "circle",
+        source: POWER_LINE_DOTS_SOURCE_ID,
+        paint: {
+          "circle-radius": 3.1,
+          "circle-color": "#e8fbff",
+          "circle-stroke-color": "#0fb2e6",
+          "circle-stroke-width": 1,
+          "circle-opacity": 0.95,
+        },
       });
 
       map.addSource("drone-trails", {
@@ -318,24 +704,6 @@ export default function CommandMap({
         },
       });
 
-      map.addLayer({
-        id: "3d-buildings",
-        source: "composite",
-        "source-layer": "building",
-        filter: ["==", "extrude", "true"],
-        type: "fill-extrusion",
-        minzoom: 14,
-        layout: {
-          visibility: "none",
-        },
-        paint: {
-          "fill-extrusion-color": "#275f77",
-          "fill-extrusion-height": ["get", "height"],
-          "fill-extrusion-base": ["get", "min_height"],
-          "fill-extrusion-opacity": 0.52,
-        },
-      });
-
       setMapReady(true);
       map.resize();
     });
@@ -376,6 +744,73 @@ export default function CommandMap({
       map.off("click", onClick);
     };
   }, [mapClickMode, onMapClick]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady || !map.getLayer(POWER_LINE_HIT_LAYER)) {
+      return;
+    }
+
+    const popup = powerLinePopupRef.current
+      ?? new Popup({ closeButton: false, className: "pg-popup" });
+    powerLinePopupRef.current = popup;
+
+    const clearHoverState = () => {
+      if (powerLineHoverIdRef.current !== null) {
+        map.setFeatureState(
+          { source: POWER_LINE_SOURCE_ID, id: powerLineHoverIdRef.current },
+          { hover: false },
+        );
+        powerLineHoverIdRef.current = null;
+      }
+      popup.remove();
+    };
+
+    const onMove = (event: mapboxgl.MapMouseEvent) => {
+      const feature = event.features?.[0];
+      if (!feature) {
+        return;
+      }
+
+      const featureId = feature.id ?? feature.properties?.id;
+      if (featureId === undefined || featureId === null) {
+        return;
+      }
+
+      if (powerLineHoverIdRef.current !== featureId) {
+        if (powerLineHoverIdRef.current !== null) {
+          map.setFeatureState(
+            { source: POWER_LINE_SOURCE_ID, id: powerLineHoverIdRef.current },
+            { hover: false },
+          );
+        }
+        map.setFeatureState({ source: POWER_LINE_SOURCE_ID, id: featureId }, { hover: true });
+        powerLineHoverIdRef.current = featureId;
+      }
+
+      const name = feature.properties?.name ?? "Power line";
+      const operator = feature.properties?.operator ?? "Unknown operator";
+      const voltage = Number(feature.properties?.voltage_kv ?? 0);
+      const region = feature.properties?.region ?? "Unspecified";
+      const voltageLabel = voltage ? `${voltage} kV` : "Voltage unknown";
+
+      popup
+        .setLngLat(event.lngLat)
+        .setHTML(
+          `<div class="popup-body"><h4>${name}</h4><p>${voltageLabel} • ${operator}</p><p>Region: ${region}</p></div>`,
+        )
+        .addTo(map);
+    };
+
+    map.on("mousemove", POWER_LINE_HIT_LAYER, onMove);
+    map.on("mouseleave", POWER_LINE_HIT_LAYER, clearHoverState);
+
+    return () => {
+      map.off("mousemove", POWER_LINE_HIT_LAYER, onMove);
+      map.off("mouseleave", POWER_LINE_HIT_LAYER, clearHoverState);
+      clearHoverState();
+    };
+  }, [mapReady]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -582,6 +1017,25 @@ export default function CommandMap({
         drawDroneTrails();
       }
 
+      const map = mapRef.current;
+      if (map && powerLineLoadedRef.current) {
+        if (map.getLayer(POWER_LINE_FLOW_LAYER)) {
+          const dashIndex = Math.floor(now / FLOW_DASH_STEP_MS) % FLOW_DASH_SEQUENCE.length;
+          if (dashIndex !== powerLineDashRef.current) {
+            map.setPaintProperty(POWER_LINE_FLOW_LAYER, "line-dasharray", FLOW_DASH_SEQUENCE[dashIndex]);
+            powerLineDashRef.current = dashIndex;
+          }
+        }
+
+        if (now - powerLineLastUpdateRef.current >= POWER_LINE_DOT_UPDATE_MS) {
+          const dotsSource = map.getSource(POWER_LINE_DOTS_SOURCE_ID) as mapboxgl.GeoJSONSource | undefined;
+          if (dotsSource && powerLineTracksRef.current.length > 0) {
+            dotsSource.setData(buildPowerLineDots(powerLineTracksRef.current, now));
+            powerLineLastUpdateRef.current = now;
+          }
+        }
+      }
+
       interpolationFrameRef.current = window.requestAnimationFrame(tick);
     };
 
@@ -679,6 +1133,12 @@ export default function CommandMap({
         </div>
       ) : null}
 
+      {powerLineError ? (
+        <div className="map-load-error map-load-error-secondary" role="status" aria-live="polite">
+          Power-line layer: {powerLineError}
+        </div>
+      ) : null}
+
       <button
         type="button"
         className={`map-ops-toggle ${showControls ? "open" : ""}`}
@@ -699,9 +1159,11 @@ export default function CommandMap({
         <button type="button" className="map-op-btn" onClick={() => setAutoFollow((value) => !value)}>
           Auto-follow: {autoFollow ? "On" : "Off"}
         </button>
-        <button type="button" className="map-op-btn" onClick={toggle3DBuildings}>
-          3D: {is3dEnabled ? "On" : "Off"}
-        </button>
+        {has3dBuildings ? (
+          <button type="button" className="map-op-btn" onClick={toggle3DBuildings}>
+            View: {is3dEnabled ? "3D" : "2D"}
+          </button>
+        ) : null}
         <button
           type="button"
           className="map-op-btn"
